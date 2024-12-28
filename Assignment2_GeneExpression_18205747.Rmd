@@ -1,0 +1,580 @@
+---
+title: "Assignment 2 - Gene Expression Analysis and Interpretation"
+author: "Ehab Issa 18205747"
+output: html_document
+---
+
+
+
+##Untar Folder and Extract Files
+```{r}
+
+#Path to tar.gz
+file_path= paste("./brca_tcga_pan_can_atlas_2018.tar.gz", sep= "/")
+
+#Decompress tar.gz
+untar(file_path)
+
+#Define path to extracted folder
+folder_path = paste(getwd(),"brca_tcga_pan_can_atlas_2018", sep = "/" )
+
+```
+
+
+```{r}
+data_patient_path = paste(folder_path,"data_clinical_patient.txt", sep = "/")
+
+data_mrna_seq_v2_path = paste(folder_path,"data_mrna_seq_v2_rsem.txt", sep = "/")
+
+data_cna_path = paste(folder_path,"data_cna.txt", sep = "/")
+```
+
+
+
+##Read RNA-seq, Patient Data, Copy Number Aberrations files
+```{r}
+
+data_patient = read.delim(data_patient_path)
+data_mrna_seq_v2 = read.delim(data_mrna_seq_v2_path)
+data_cna= read.delim(data_cna_path)
+
+#Skip 5 rows of column descriptions. 
+data_patient = data_patient[5:dim(data_patient)[1],]
+
+```
+
+
+##Match the RNA-seq patient ids with the CNA ids and the Patient Data ids.
+```{r}
+#Extract patient IDs from the datasets excluding unnecessary columns
+rna_patient_ids <- colnames(data_mrna_seq_v2)[-c(1, 2)] 
+cna_patient_ids <- colnames(data_cna)[-c(1, 2)] 
+patient_ids <- data_patient[, 1] 
+
+#Replace "." with "-" and remove unecessary characters
+rna_patient_ids <- gsub("\\.", "-", rna_patient_ids) 
+cna_patient_ids <- gsub("\\.", "-", cna_patient_ids) 
+cna_patient_ids <- substr(cna_patient_ids, 1, 12) 
+rna_patient_ids <- substr(rna_patient_ids, 1, 12)
+
+#Find the common patient IDs
+common_RNACNA_ids <- intersect(rna_patient_ids, cna_patient_ids)
+common_patient_ids <- intersect(common_RNACNA_ids, patient_ids)
+
+data_mrna_seq_v2_matched <- data_mrna_seq_v2[, which(rna_patient_ids %in% common_patient_ids)]
+data_cna_matched <- data_cna[, which(cna_patient_ids %in% common_patient_ids)]
+data_patient_matched <- data_patient[which(data_patient[, 1] %in% common_patient_ids), ]
+
+#Update column names
+colnames(data_mrna_seq_v2_matched)[-c(1, 2)] <- common_patient_ids
+colnames(data_cna_matched)[-c(1, 2)] <- common_patient_ids
+
+#Remove rows with missing Hugo symbol
+data_mrna_seq_v2_matched <- data_mrna_seq_v2_matched[data_mrna_seq_v2_matched[, 1] != "", ]
+
+```
+
+##Create metadata using the CNA level of ERBB2+ (greater than 0 means amplified).
+```{r}
+#Find the row number for ERBB2 in the CNA data
+erbb2_row <- which(data_cna_matched[, 1] == "ERBB2") 
+
+#Extract CNA values for ERBB2 
+erbb2_cna_values <- as.numeric(data_cna_matched[erbb2_row,-c(1,2)])
+
+# Create metadata with zero matrix and assign rows and column names
+metadata <- matrix(0, nrow = length(erbb2_cna_values), ncol = 1) 
+rownames(metadata) <- colnames(data_cna_matched)[-c(1, 2)] 
+colnames(metadata) <- c("ERBB2_Amplified") 
+
+#Populate metadata
+metadata[, 1] <- as.numeric(erbb2_cna_values > 0)
+
+#Check number of amplified vs non-amplified
+print(table(metadata[, 1]))
+
+```
+
+
+##Normalize data using DESeq2.
+```{r}
+if (!requireNamespace("DESeq2", quietly = TRUE)) {
+    install.packages("BiocManager")
+    BiocManager::install("DESeq2")
+}
+library(DESeq2)
+
+#Extract assay where Columns 1 and 2 are gene names.
+assay <- round(as.matrix(data_mrna_seq_v2_matched[, -c(1,2)]))
+rownames(assay) <- data_mrna_seq_v2_matched[,1]
+
+#Convert metadata to dataframe
+column_data <- data.frame(ERBB2_Amplified = factor(metadata[,1]), row.names = rownames(metadata))
+
+#Create DESeq2 dataset 
+DES_dataset <- DESeqDataSetFromMatrix(countData = assay, colData = column_data, design = ~ ERBB2_Amplified)
+
+#Use low count genes
+DES_dataset <- DES_dataset[rowSums(counts(DES_dataset))> 10, ]
+
+#Normalize data
+DES_dataset <- DESeq(DES_dataset)
+
+#Extract normalised assay
+normalized_assay <- counts(DES_dataset,normalized = TRUE)
+```
+
+
+##Get the variance stabilised transformed expression values.
+```{r}
+#Variance Stabilising Transformation
+vst_count <- vst(DES_dataset)
+
+``` 
+
+
+##Obtain Differentially Expressed Genes.
+```{r}
+#Get results for differential expression analysis
+DEG_Results <- results(DES_dataset)
+
+#Add gene names as column
+DataFrame_results <- as.data.frame(DEG_Results)
+DataFrame_results$Gene <- rownames(DEG_Results)
+
+#Remove NA in log2FoldChange
+DataFrame_results <- subset(DataFrame_results, !is.na(log2FoldChange))
+
+
+#Volcano Plot of  Differential Expression Analysis
+DEG_Results$Significance <- ifelse(
+  DEG_Results$padj < 0.05 & abs(DEG_Results$log2FoldChange) > 2, 
+  "Significant", 
+  "Not Significant"
+)
+ggplot(DEG_Results, aes(x = log2FoldChange, y = -log10(padj), color = Significance)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  scale_color_manual(values = c("Not Significant" = "lightblue", "Significant" = "red")) +
+  labs(
+    title = "Volcano Plot of Differential Expression Analysis",
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted p-value",
+    color = "Significance"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "top"
+  )
+
+
+#Rank genes by absolute log2 fold change
+FoldChange_rank <- DataFrame_results[order(abs(DataFrame_results$log2FoldChange), decreasing = TRUE), ]
+
+#Select Top 10 
+top10 <- FoldChange_rank[1:10, ]
+
+print(top10)
+
+
+
+#Bar plot of top ranked genes by Fold Change
+ggplot(top10, aes(x = reorder(Gene, abs(log2FoldChange)), y = log2FoldChange, fill = log2FoldChange )) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Top 10 Differentially Expressed Genes",
+    x = "Genes",
+    y = "Log2 Fold Change"
+  ) +
+   theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "top"
+  )
+
+
+```
+
+
+##Perform a Pathway Enrichment Analysis
+```{r}
+#Subset significant DEG by p-value
+DEG_Results_filtered <- DEG_Results[!is.na(DEG_Results$padj), ]
+
+DE_genes <- DEG_Results_filtered[DEG_Results_filtered$padj < 0.05, ]
+
+#Seperate DEGs 
+DE_over <- rownames(DE_genes[DE_genes$log2FoldChange > 0, ])
+DE_under <- rownames(DE_genes[DE_genes$log2FoldChange < 0, ])
+
+```
+
+
+```{r}
+#Perform Gene Ontology(GO) Enrichment Analysis
+
+if (!requireNamespace("clusterProfiler", quietly = TRUE))
+  BiocManager::install("clusterProfiler")
+
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+  BiocManager::install("org.Hs.eg.db")
+
+if (!requireNamespace("enrichplot", quietly = TRUE))
+  install.packages("enrichplot")
+
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ggplot2)
+
+
+#Over-Expressed DEG
+GO_results_over <- enrichGO(
+  gene          = DE_over,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP", 
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+#Under Expressed Gene
+Go_results_under = enrichGO(
+  gene          = DE_under,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",  
+  ont           = "BP", 
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+
+#Create dotplots for over and under expressed genes of GO
+print(head(GO_results_over))
+
+dotplot(GO_results_over, showCategory=10) + ggtitle("Gene Ontology Enrichment Under Expressed")
+
+
+print(head(Go_results_under))
+
+dotplot(Go_results_under, showCategory=10) + ggtitle("Gene Ontology Enrichment Under Expressed")
+```
+
+
+```{r}
+#Convert Gene IDs for KEGG and Reactome Analysis
+if (!requireNamespace("pathview", quietly = TRUE))
+  BiocManager::install("pathview")
+
+if (!requireNamespace("ReactomePA", quietly = TRUE))
+  BiocManager::install("ReactomePA")
+
+library(ReactomePA)
+library(pathview)
+
+#Convert gene symbols to Entrez IDS 
+gene_entrez_over <- bitr(DE_over, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+gene_entrez_under <- bitr(DE_under, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+```
+
+```{r, fig.height = 6}
+
+#KEGG Pathway Enrichment:
+kegg_results_over =  enrichKEGG(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+kegg_results_under =  enrichKEGG(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+#Create dotplots for over and under expressed genes of KEGG
+print(head(kegg_results_over))
+
+dotplot(kegg_results_over, showCategory=10) + ggtitle("Kegg Pathway Enrichment Over Expressed")
+
+print(head(kegg_results_under))
+
+dotplot(kegg_results_under, showCategory=10) + ggtitle("Kegg Pathway Enrichment Under Expressed")
+```
+
+```{r, fig.height = 6}
+
+#Reactome Pathway Enrichment
+reactome_results_over =  enrichPathway(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+
+reactome_results_under =  enrichPathway(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+
+#Create dotplots for over and under expressed genes of Reactome
+print(head(reactome_results_over))
+
+dotplot(reactome_results_over, showCategory=10) + ggtitle("Reactome Pathway Enrichment Over Expressed")
+
+print(head(reactome_results_under))
+
+dotplot(reactome_results_under, showCategory=10) + ggtitle("Reactome Pathway Enrichment Under Expressed")
+```
+
+
+```{r,fig.height= 12, fig.width= 12 }
+
+#Pairwise term similarities for over expressed gene from GO results and visualse with tree plot
+go_results_over_pw = pairwise_termsim(GO_results_over)
+treeplot(go_results_over_pw)+ ggtitle("GO Enrichment Over Expressed")
+
+#Pairwise term similarities for under expressed gene from GO results and visualse with tree plot
+go_results_under_pw = pairwise_termsim(Go_results_under)
+treeplot(go_results_under_pw)+ ggtitle("GO Enrichment Under Expressed")
+
+
+```
+
+
+
+##Obtain a #Principal Component Analysis (PCA) plot
+```{r}
+
+#Apply VST to DES_dataet
+vsd = vst(DES_dataset)
+
+#Show 2 plots side by side and generate plot
+par(mfrow = c(1, 2))
+plotPCA(vsd, intgroup = c("ERBB2_Amplified")) + ggtitle("Principal Component Analysis")
+
+
+```
+
+##Obtain Heat Plot
+```{r}
+
+#Subset the dataset on differentially expressed gene 
+top_DE = order(DEG_Results$padj)
+
+#Get top most differntial genes
+vsd_DE = assay(vsd)[top_DE[1:20],]
+
+
+# install packages for nicer heatmap than R's base one. 
+
+if (!requireNamespace("pheatmap", quietly = TRUE))
+  install.packages("pheatmap")
+
+
+library(pheatmap)
+
+#Get annotation dataframe and align with column names
+annotation_col <- data.frame(ERBB2_Amplified = as.factor(metadata[, 1]))
+rownames(annotation_col) <- colnames(vst_count)
+
+#Pick Custom colors
+annotation_colors <- list(
+  ERBB2_Amplified = c("0" = "#1f78b4", "1" = "#33a02c") # Custom colors for 0 (non-amplified) and 1 (amplified)
+)
+
+#Generate the heatmap
+pheatmap(
+  vsd_DE,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = 'row',
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  annotation_col = annotation_col,
+  annotation_colors = annotation_colors,
+  main = "Heatmap of Top Differentially Expressed Genes"
+)
+
+
+```
+
+
+
+#Generate  Overall Survival Model.
+```{r}
+
+if (!requireNamespace("glmnet", quietly = TRUE)) install.packages("glmnet")
+if (!requireNamespace("survival", quietly = TRUE)) install.packages("survival")
+if (!requireNamespace("survminer", quietly = TRUE)) install.packages("survminer")
+
+library(glmnet)
+library(survival)
+library(survminer)
+
+```
+
+
+## 1. Preprocess Data
+```{r}
+
+#Extract assay data
+assay <- round(as.matrix(data_mrna_seq_v2_matched[, -c(1, 2)]))
+rownames(assay) <- data_mrna_seq_v2_matched[, 1]
+
+#Convert metadata to dataframe
+column_data <- data.frame(ERBB2_Amplified = factor(metadata[, 1]), row.names = rownames(metadata))
+
+#Create DESeq2 dataset
+DES_dataset <- DESeqDataSetFromMatrix(countData = assay, colData = column_data, design = ~ ERBB2_Amplified)
+
+#Remove low-count genes
+DES_dataset <- DES_dataset[rowSums(counts(DES_dataset)) > 10, ]
+
+#Normalize data
+DES_dataset <- DESeq(DES_dataset)
+
+#Variance Stabilizing Transformation
+vst <- vst(DES_dataset)
+
+#Extract vst matrix
+vst_matrix <- assay(vst)
+```
+
+
+
+## 2. Differential Expression Analysis
+```{r}
+#Get results for differential expression analysis
+DEG_Results <- results(DES_dataset)
+
+#Add gene names as a column
+DEG_Results <- as.data.frame(DEG_Results)
+DEG_Results$Gene <- rownames(DEG_Results)
+
+#Filter significant DE genes
+DEG_Results <- subset(DEG_Results, !is.na(padj) & padj < 0.05)
+
+#Subset vst matrix to include DE genes
+top_DE_genes <- DEG_Results$Gene
+vst_DE <- vst_matrix[rownames(vst_matrix) %in% top_DE_genes, ]
+```
+
+
+
+## 3. Align Survival Data with vst_DE
+```{r}
+#Name Survival Data
+survival_data <- data_patient_matched[, c("Overall.Survival..Months.", "Overall.Survival.Status")]
+
+#Set row names to patient IDs
+rownames(survival_data) <- data_patient_matched[, 1]
+
+#Replace "." with "-" in vst_DE and survival_data
+colnames(vst_DE) <- gsub("\\.", "-", colnames(vst_DE))
+rownames(survival_data) <- gsub("\\.", "-", rownames(survival_data))
+
+# Find common samples between vst_DE and survival_data
+common_samples <- intersect(rownames(survival_data), colnames(vst_DE))
+survival_data <- survival_data[rownames(survival_data) %in% common_samples, ]
+vst_DE <- vst_DE[, common_samples]
+
+#Retain Rows with no missing values and variance
+vst_DE <- vst_DE[apply(vst_DE, 1, function(x) all(!is.na(x)) && var(x) > 0), ]
+```
+
+
+
+## 4. Create Survival Object
+
+```{r}
+#Make Survival Status Binary
+survival_data$Overall.Survival.Status <- ifelse(
+  survival_data$Overall.Survival.Status == "1:DECEASED", 1, 0
+)
+#Convert survival time to numeric
+survival_data$Overall.Survival..Months. <- as.numeric(as.character(survival_data$Overall.Survival..Months.))
+
+#Remove any NA values
+survival_data <- survival_data[!is.na(survival_data$Overall.Survival..Months.) & 
+                               !is.na(survival_data$Overall.Survival.Status), ]
+
+survival_data <- survival_data[survival_data$Overall.Survival..Months. > 0, ]
+
+#Create survival object
+y <- Surv(
+  time = survival_data$Overall.Survival..Months.,
+  event = survival_data$Overall.Survival.Status
+)
+
+#Subset vst_DE to survival_data
+common_samples <- intersect(rownames(survival_data), colnames(vst_DE))
+survival_data <- survival_data[common_samples, ]
+vst_DE <- vst_DE[, common_samples]
+
+#Design Matrix with transpose matrix
+X <- t(vst_DE)
+```
+
+
+## 5. Lasso Regularized Cox Regression
+```{r}
+#Fit Lasso Regularized Cox Regression with cross-validation
+cvfit <- cv.glmnet(X, y, family = "cox", alpha = 1)
+
+#Extract the best lambda
+best_lambda <- cvfit$lambda.min
+cat("Best lambda:", best_lambda, "\n")
+
+#Fit the final model with the best lambda
+final_model <- glmnet(X, y, family = "cox", alpha = 1, lambda = best_lambda)
+
+#Extract coefficients
+coefficients <- coef(final_model)
+# Convert coefficients to a matrix
+coef_matrix <- as.matrix(coefficients)
+
+#Extract the rownames of non-zero coefficients
+selected_genes <- rownames(coef_matrix)[coef_matrix != 0]
+cat("Selected genes with non-zero coefficients:\n", selected_genes)
+```
+
+
+
+# 6. Create Plots
+```{r}
+
+#Plot cross-validation curve
+plot(cvfit)
+mtext("Cross-Validation for Lasso Cox Regression", side = 3, line = 2, cex = 1.2)
+
+#Estimate risk scores
+risk_scores <- predict(final_model, newx = X, type = "link")
+
+#Divide patients into high- and low-risk groups
+median_risk <- median(risk_scores)
+survival_data$risk_group <- ifelse(risk_scores > median_risk, "High Risk", "Low Risk")
+
+#Fit the Kaplan-Meier
+km_fit <- survfit(Surv(Overall.Survival..Months., Overall.Survival.Status) ~ risk_group, data = survival_data)
+
+#Plot Kaplan-Meier survival curves
+ggsurvplot(km_fit, data = survival_data, pval = TRUE, risk.table = TRUE, conf.int = TRUE, title = "Kaplan-Meier Survival Curve of High vs Low Risk Groups", legend.title = "Risk Groups",  legend.labs = c("High Risk", "Low Risk"), xlab = "Time (Months)", ylab = "Overall Survival Probability", ggtheme = theme_minimal()
+)
+```
+
+
+
+``` 
+
